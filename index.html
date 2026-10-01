@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M1 · The Awakening of the DOM</title>
+<style>
+  :root { --bg: #fff; --fg: #000; --muted: #5c5c5c; --error: #b3261e; }
+  :root.dark { --bg: #000; --fg: #fff; --muted: #a8a8a8; --error: #ff8a80; }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    overflow: hidden;
+    transition: background .4s, color .4s;
+  }
+
+  #field { position: fixed; inset: 0; user-select: none; -webkit-user-select: none; touch-action: manipulation; }
+
+  #hud {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 1;
+    display: none; justify-content: space-between;
+    padding: 18px 22px; font-size: 17px; pointer-events: none;
+  }
+  body.playing #hud { display: flex; }
+
+  .dot {
+    position: absolute; width: 34px; height: 34px; margin: -17px 0 0 -17px;
+    border-radius: 50%; background: var(--fg); cursor: pointer;
+    transition: background .4s;
+    animation: appear .18s ease-out;
+  }
+  .dot.pop { animation: pop .14s ease-in forwards; pointer-events: none; }
+  @keyframes appear { from { transform: scale(0); } to { transform: scale(1); } }
+  @keyframes pop { to { transform: scale(0); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .dot, .dot.pop { animation: none; } body { transition: none; } }
+
+  .overlay {
+    position: fixed; inset: 0; z-index: 2; display: none;
+    align-items: center; justify-content: center; padding: 20px;
+    background: color-mix(in srgb, var(--bg) 72%, transparent);
+  }
+  .overlay.show { display: flex; }
+
+  .window { width: min(380px, 100%); background: var(--bg); border: 2px solid var(--fg); padding: 26px; }
+  h1, h2 { margin: 0 0 12px; font-size: 24px; line-height: 1.2; font-weight: 700; }
+  p { margin: 0 0 16px; font-size: 16px; line-height: 1.5; }
+  label { display: block; font-size: 15px; margin-bottom: 6px; }
+  input + label { margin-top: 10px; }
+  input {
+    width: 100%; font: inherit; font-size: 22px; padding: 8px 10px; margin-bottom: 8px;
+    background: var(--bg); color: var(--fg); border: 2px solid var(--fg); border-radius: 0;
+  }
+  .error { min-height: 1.3em; margin: 0 0 8px; font-size: 14px; color: var(--error); }
+  .hint { padding-top: 14px; border-top: 1px solid var(--fg); color: var(--muted); font-size: 15px; }
+  button {
+    width: 100%; padding: 11px; font: inherit; font-size: 17px; cursor: pointer;
+    background: var(--fg); color: var(--bg); border: 2px solid var(--fg); border-radius: 0;
+  }
+  button:hover { opacity: .85; }
+  input:focus-visible, button:focus-visible { outline: 2px solid var(--fg); outline-offset: 3px; }
+</style>
+</head>
+<body>
+
+<div id="hud" aria-live="off">
+  <span id="count"></span>
+  <span id="score"></span>
+</div>
+
+<div id="field"></div>
+
+<div id="setup" class="overlay show">
+  <div class="window" role="dialog" aria-labelledby="setup-title">
+    <h1 id="setup-title">The Awakening of the DOM</h1>
+    <p>Set how many points can be on screen at once. If there are more, you lose.</p>
+    <label for="limit">Point limit (1 to 99)</label>
+    <input id="limit" type="number" min="1" max="99" step="1" value="5" inputmode="numeric">
+    <label for="speed">Seconds between points (0.2 to 10)</label>
+    <input id="speed" type="number" min="0.2" max="10" step="0.1" value="1" inputmode="decimal">
+    <p id="error" class="error" role="alert"></p>
+    <p class="hint">Left click over the points to pop them.</p>
+    <button id="start" type="button">Start game</button>
+  </div>
+</div>
+
+<div id="lose" class="overlay">
+  <div class="window" role="alertdialog" aria-labelledby="lose-title">
+    <h2 id="lose-title">You lose</h2>
+    <p id="lose-msg"></p>
+    <button id="again" type="button">Play again</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const SIZE = 34, PAD = 14, HUD_H = 60;
+  const $ = (id) => document.getElementById(id);
+  const field = $('field'), input = $('limit'), speedInput = $('speed'), errorEl = $('error');
+  const countEl = $('count'), scoreEl = $('score');
+  const setup = $('setup'), lose = $('lose');
+
+  let state = 'setup';            // 'setup' | 'playing' | 'lost'
+  let limit = 5, interval = 1000, score = 0, timer = null;
+  let pointer = null;             // last known mouse position
+  const dots = new Set();         // dots currently on screen (not yet popped)
+
+  function updateHud() {
+    countEl.textContent = dots.size + ' of ' + limit + ' points';
+    scoreEl.textContent = 'Popped ' + score;
+  }
+
+  // Dots store their position as a 0–1 fraction so they survive window resizes.
+  function position(fx, fy) {
+    const w = field.clientWidth, h = field.clientHeight;
+    return {
+      x: PAD + SIZE / 2 + fx * Math.max(0, w - 2 * PAD - SIZE),
+      y: HUD_H + SIZE / 2 + fy * Math.max(0, h - HUD_H - PAD - SIZE)
+    };
+  }
+
+  function place(dot) {
+    const p = position(dot.fx, dot.fy);
+    dot.x = p.x; dot.y = p.y;
+    dot.style.left = p.x + 'px';
+    dot.style.top = p.y + 'px';
+  }
+
+  function spawn() {
+    const dot = document.createElement('div');
+    dot.className = 'dot';
+    // Try to avoid overlapping an existing dot so every point stays clickable.
+    for (let i = 0; i < 40; i++) {
+      dot.fx = Math.random();
+      dot.fy = Math.random();
+      const p = position(dot.fx, dot.fy);
+      if ([...dots].every((d) => Math.hypot(d.x - p.x, d.y - p.y) > SIZE * 1.4)) break;
+    }
+    place(dot);
+    field.appendChild(dot);
+    dots.add(dot);
+    updateHud();
+    if (dots.size > limit) endGame();
+  }
+
+  function schedule() {
+    timer = setTimeout(() => {
+      spawn();
+      if (state === 'playing') schedule();
+    }, interval * (0.85 + Math.random() * 0.3));   // chosen interval, ±15%
+  }
+
+  function pop(dot) {
+    if (state !== 'playing' || !dots.has(dot)) return false;
+    dots.delete(dot);
+    score++;
+    updateHud();
+    dot.classList.add('pop');
+    setTimeout(() => dot.remove(), 200);
+    return true;
+  }
+
+  function clearField() {
+    dots.clear();
+    field.replaceChildren();
+  }
+
+  function start() {
+    const n = Number(input.value);
+    if (input.value.trim() === '' || !Number.isInteger(n) || n < 1 || n > 99) {
+      errorEl.textContent = 'Enter a whole number between 1 and 99 for the point limit.';
+      input.focus();
+      return;
+    }
+    const secs = Number(speedInput.value);
+    if (speedInput.value.trim() === '' || !Number.isFinite(secs) || secs < 0.2 || secs > 10) {
+      errorEl.textContent = 'Enter a time between 0.2 and 10 seconds.';
+      speedInput.focus();
+      return;
+    }
+    errorEl.textContent = '';
+    limit = n;
+    interval = secs * 1000;
+    score = 0;
+    clearField();
+    setup.classList.remove('show');
+    lose.classList.remove('show');
+    document.activeElement.blur();          // so the keyboard never triggers a button
+    document.body.classList.add('playing');
+    state = 'playing';
+    updateHud();
+    spawn();
+    schedule();
+  }
+
+  function endGame() {
+    state = 'lost';
+    clearTimeout(timer);
+    $('lose-msg').textContent =
+      'More than ' + limit + (limit === 1 ? ' point was' : ' points were') +
+      ' on screen. You popped ' + score + (score === 1 ? ' point.' : ' points.');
+    lose.classList.add('show');
+  }
+
+  function backToSetup() {
+    lose.classList.remove('show');
+    clearField();
+    document.body.classList.remove('playing');
+    state = 'setup';
+    setup.classList.add('show');
+    input.focus();
+    input.select();
+  }
+
+  // Left click on a point
+  field.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const dot = e.target.closest('.dot');
+    if (dot) pop(dot);
+  });
+
+  // Track the mouse so the keyboard can act on the point under it
+  window.addEventListener('pointermove', (e) => { pointer = { x: e.clientX, y: e.clientY }; });
+  window.addEventListener('pointerdown', (e) => { pointer = { x: e.clientX, y: e.clientY }; });
+
+  // Space bar: pops the point under the cursor and quietly toggles dark mode
+  window.addEventListener('keydown', (e) => {
+    if (state !== 'playing' || e.code !== 'Space') return;
+    e.preventDefault();
+    if (e.repeat || !pointer) return;
+    const el = document.elementFromPoint(pointer.x, pointer.y);
+    const dot = el && el.closest('.dot');
+    if (dot && pop(dot)) document.documentElement.classList.toggle('dark');
+  });
+
+  window.addEventListener('resize', () => dots.forEach(place));
+  [input, speedInput].forEach((el) =>
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') start(); }));
+  $('start').addEventListener('click', start);
+  $('again').addEventListener('click', backToSetup);
+
+  input.focus();
+})();
+</script>
+</body>
+</html>
